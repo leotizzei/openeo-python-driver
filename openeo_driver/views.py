@@ -1824,6 +1824,7 @@ def register_views_catalog(
     @api_endpoint
     @blueprint.route('/collections', methods=['GET'])
     @backend_implementation.cache_control
+    @auth_handler.requires_bearer_auth
     def collections():
         metadata = [
             _normalize_collection_metadata(metadata=m, api_version=requested_api_version(), full=False)
@@ -1842,12 +1843,14 @@ def register_views_catalog(
     @api_endpoint
     @blueprint.route('/collections/<collection_id>', methods=['GET'])
     @backend_implementation.cache_control
+    @auth_handler.requires_bearer_auth
     def collection_by_id(collection_id):
         metadata = backend_implementation.catalog.get_collection_metadata(collection_id=collection_id)
         metadata = _normalize_collection_metadata(metadata=metadata, api_version=requested_api_version(), full=True)
         return jsonify(metadata)
 
     @blueprint.route('/collections/<collection_id>/items', methods=['GET'])
+    @auth_handler.requires_bearer_auth
     def collection_items(collection_id):
         # Note: This is not an openEO API endpoint, but a STAC API endpoint
         # https://stacspec.org/STAC-api.html#operation/getFeatures
