@@ -455,6 +455,7 @@ def register_views_general(
     @api_endpoint(version=ComparableVersion("1.0.0").accept_lower)
     @blueprint.route('/output_formats')
     @backend_implementation.cache_control
+    @auth_handler.requires_bearer_auth
     def output_formats():
         # TODO deprecated endpoint, remove it when v0.4 API support is not necessary anymore
         return jsonify(backend_implementation.file_formats()["output"])
@@ -468,6 +469,7 @@ def register_views_general(
     @api_endpoint
     @blueprint.route('/udf_runtimes')
     @backend_implementation.cache_control
+    @auth_handler.requires_bearer_auth
     def udf_runtimes():
         runtimes = backend_implementation.udf_runtimes.get_udf_runtimes()
         return jsonify(runtimes)
@@ -612,6 +614,7 @@ def register_views_processing(
 
     @api_endpoint(hidden=is_not_implemented(backend_implementation.processing.validate))
     @blueprint.route('/validation', methods=["POST"])
+    @auth_handler.requires_http_basic_auth
     def validation():
         post_data = request.get_json()
         try:
@@ -716,6 +719,7 @@ def register_views_processing(
     @api_endpoint
     @blueprint.route('/processes', methods=['GET'])
     @backend_implementation.cache_control
+    @auth_handler.requires_http_basic_auth
     def processes():
         process_registry = backend_implementation.processing.get_process_registry(api_version=requested_api_version())
         processes = process_registry.get_specs()
@@ -727,6 +731,7 @@ def register_views_processing(
     @api_endpoint
     @blueprint.route('/processes/<namespace>', methods=['GET'])
     @backend_implementation.cache_control
+    @auth_handler.requires_http_basic_auth
     def processes_from_namespace(namespace):
         # TODO: this endpoint is in draft at the moment
         #       see https://github.com/Open-EO/openeo-api/issues/310, https://github.com/Open-EO/openeo-api/pull/348
@@ -756,6 +761,7 @@ def register_views_processing(
     @api_endpoint
     @blueprint.route('/processes/<namespace>/<process_id>', methods=['GET'])
     @backend_implementation.cache_control
+    @auth_handler.requires_http_basic_auth
     def processes_details(namespace, process_id):
         # TODO: this endpoint is in draft at the moment
         #       see https://github.com/Open-EO/openeo-api/issues/310, https://github.com/Open-EO/openeo-api/pull/348
@@ -1267,6 +1273,7 @@ def register_views_batch_jobs(
 
     @api_endpoint
     @blueprint.route('/jobs/<job_id>/results/items/<user_base64>/<secure_key>/<item_id>', methods=['GET'])
+    @auth_handler.requires_http_basic_auth
     def get_job_result_item_signed(job_id, user_base64, secure_key, item_id):
         expires = request.args.get('expires')
         signer = get_backend_config().url_signer
@@ -1451,6 +1458,7 @@ def register_views_batch_jobs(
 
     @api_endpoint
     @blueprint.route('/jobs/<job_id>/results/assets/<user_base64>/<secure_key>/<filename>', methods=['GET'])
+    @auth_handler.requires_http_basic_auth
     def download_job_result_signed(job_id, user_base64, secure_key, filename):
         expires = request.args.get('expires')
         signer = get_backend_config().url_signer
@@ -1540,6 +1548,7 @@ def register_views_secondary_services(
 ):
     @api_endpoint
     @blueprint.route('/service_types', methods=['GET'])
+    @auth_handler.requires_http_basic_auth
     def service_types():
         service_types = backend_implementation.secondary_services.service_types()
         expected_fields = {"configuration", "process_parameters"}
