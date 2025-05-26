@@ -1,5 +1,4 @@
 import copy
-import datetime as dt
 import functools
 import json
 import logging
@@ -26,6 +25,7 @@ from flask import (
     send_from_directory,
     url_for,
 )
+import openeo.metadata
 from openeo.util import Rfc3339, TimingLogger, deep_get, dict_no_none, rfc3339
 from openeo.utils.version import ComparableVersion
 from pyproj import CRS
@@ -57,6 +57,7 @@ from openeo_driver.errors import (
     FilePathInvalidException,
     InternalException,
     JobNotFinishedException,
+    NotFoundException,
     OpenEOApiException,
     ProcessGraphInvalidException,
     ProcessGraphMissingException,
@@ -64,6 +65,7 @@ from openeo_driver.errors import (
     ProcessUnsupportedException,
     ServiceNotFoundException,
 )
+from openeo_driver.integrations.s3.bucket_details import BucketDetails
 from openeo_driver.jobregistry import PARTIAL_JOB_STATUS
 from openeo_driver.processgraph import ProcessGraphFlatDict, extract_default_job_options_from_process_graph
 from openeo_driver.save_result import SaveResult, to_save_result
@@ -71,6 +73,7 @@ from openeo_driver.users import User, user_id_b64_decode, user_id_b64_encode
 from openeo_driver.users.auth import HttpAuthHandler
 from openeo_driver.util.geometry import BoundingBox, reproject_geometry
 from openeo_driver.util.logging import ExtraLoggingFilter, FlaskRequestCorrelationIdLogging
+from openeo_driver.util.stac import sniff_stac_extension_prefix
 from openeo_driver.utils import EvalEnv, filter_supported_kwargs, smart_bool
 
 _log = logging.getLogger(__name__)
@@ -326,7 +329,7 @@ def register_error_handlers(app: flask.Flask, backend_implementation: OpenEoBack
         # TODO: is it possible to eliminate this custom summarize_exception/ErrorSummary handling?
         error = backend_implementation.summarize_exception(error)
         if isinstance(error, ErrorSummary):
-            log_message = repr(error.exception)
+            log_message = error.summary
             if error.is_client_error:
                 api_error = OpenEOApiException(message=error.summary, code="BadRequest", status_code=400)
             else:
@@ -505,6 +508,12 @@ def register_views_general(
     def file_formats():
         return jsonify(backend_implementation.file_formats())
 
+    @api_endpoint(version=ComparableVersion("1.0.0").or_higher)
+    @blueprint.route('/processing_parameters')
+    @backend_implementation.cache_control
+    def processing_parameters():
+        return jsonify(backend_implementation.processing_parameters())
+
     @api_endpoint
     @blueprint.route('/udf_runtimes')
     @backend_implementation.cache_control
@@ -515,7 +524,7 @@ def register_views_general(
     @blueprint.route('/.well-known/openeo')
     def versioned_well_known_openeo():
         # Clients might request this for version discovery. Avoid polluting (error) logs by explicitly handling this.
-        error = OpenEOApiException(status_code=404, code="NotFound", message="Not a well-known openEO URI")
+        error = NotFoundException(message="Not a well-known openEO URI")
         return make_response(jsonify(error.to_dict()), error.status_code)
 
     @blueprint.route('/CHANGELOG', methods=['GET'])
@@ -659,6 +668,7 @@ def register_views_processing(
             process_graph = post_data["process_graph"]
         except (KeyError, TypeError) as e:
             raise ProcessGraphMissingException
+
         env = EvalEnv(
             {
                 "backend_implementation": backend_implementation,
@@ -666,6 +676,7 @@ def register_views_processing(
                 "version": g.openeo_api_version,
                 "openeo_api_version": g.openeo_api_version,
                 "user": None,
+                "validation": True
             }
         )
         errors = backend_implementation.processing.validate(process_graph=process_graph, env=env)
@@ -875,25 +886,6 @@ def _properties_from_job_info(job_info: BatchJobMetadata) -> dict:
     return properties
 
 
-def _s3_client():
-    """Create an S3 client to access object storage on Swift."""
-
-    # Keep this import inside the method so we kan keep installing boto3 as optional,
-    # because we don't always use objects storage.
-    # We want to avoid unnecessary dependencies. (And dependencies  of dependencies!)
-    import boto3
-
-    # TODO: Get these credentials/secrets from config instead of os.environ
-    aws_access_key_id = os.environ.get("SWIFT_ACCESS_KEY_ID", os.environ.get("AWS_ACCESS_KEY_ID"))
-    aws_secret_access_key = os.environ.get("SWIFT_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY"))
-    swift_url = os.environ.get("SWIFT_URL")
-    s3_client = boto3.client("s3",
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        endpoint_url=swift_url)
-    return s3_client
-
-
 def _assert_valid_log_level(level: str) -> str:
     valid_levels = ["debug", "info", "warning", "error"]
     if level not in valid_levels:
@@ -964,13 +956,9 @@ def register_views_batch_jobs(
         request_parameters = flask.request.args
 
         # TODO #332 settle on receiving just `JobListing` here and eliminate other options/code paths.
-        get_user_jobs = backend_implementation.batch_jobs.get_user_jobs
-        if function_has_argument(get_user_jobs, argument="request_parameters"):
-            # TODO #332 make this the one and only code path when all `get_user_jobs` implementations are migrated
-            listing = get_user_jobs(user_id=user.user_id, limit=limit, request_parameters=request_parameters)
-        else:
-            # TODO #332 remove support for this old API
-            listing = get_user_jobs(user_id=user.user_id)
+        listing = backend_implementation.batch_jobs.get_user_jobs(
+            user_id=user.user_id, limit=limit, request_parameters=request_parameters
+        )
 
         # TODO #332 while eliminating old `get_user_jobs` API above, also just settle on JobListing based return,
         #       and drop all this legacy cruft
@@ -1037,22 +1025,6 @@ def register_views_batch_jobs(
         else:
             _log.info(f"`POST /jobs/{job_id}/results`: not (re)starting job (status {job_info.status}")
         return make_response("", 202)
-
-    def _job_result_download_url(job_id, user_id, filename) -> str:
-        signer = get_backend_config().url_signer
-        if signer:
-            expires = signer.get_expires()
-            secure_key = signer.sign_job_asset(
-                job_id=job_id, user_id=user_id, filename=filename, expires=expires
-            )
-            user_base64 = user_id_b64_encode(user_id)
-            return url_for(
-                '.download_job_result_signed',
-                job_id=job_id, user_base64=user_base64, filename=filename, expires=expires, secure_key=secure_key,
-                _external=True
-            )
-        else:
-            return url_for('.download_job_result', job_id=job_id, filename=filename, _external=True)
 
     @api_endpoint
     @blueprint.route('/jobs/<job_id>/results', methods=['GET'])
@@ -1125,7 +1097,7 @@ def register_views_batch_jobs(
                     "license": "proprietary",  # TODO?
                     "extent": {
                         "spatial": {"bbox": [[-180, -90, 180, 90]]},
-                        "temporal": {"interval": [[rfc3339.utcnow(), rfc3339.utcnow()]]},
+                        "temporal": {"interval": [[rfc3339.now_utc(), rfc3339.now_utc()]]},
                     },
                     "links": [
                         {
@@ -1179,7 +1151,9 @@ def register_views_batch_jobs(
             )
 
         assets = {
-            filename: _asset_object(job_id, user_id, filename, asset_metadata, job_info)
+            filename: _asset_object(
+                job_id=job_id, user_id=user_id, filename=filename, asset_metadata=asset_metadata, job_info=job_info
+            )
             for filename, asset_metadata in result_assets.items()
             if asset_metadata.get("asset", True)
         }
@@ -1224,7 +1198,7 @@ def register_views_batch_jobs(
                     "type": "Collection",
                     "stac_version": "1.0.0",
                     "stac_extensions": [
-                        STAC_EXTENSION.EO,
+                        STAC_EXTENSION.EO_V110,
                         STAC_EXTENSION.FILEINFO,
                         STAC_EXTENSION.PROCESSING,
                         STAC_EXTENSION.PROJECTION,
@@ -1287,8 +1261,8 @@ def register_views_batch_jobs(
                 STAC_EXTENSION.FILEINFO,
             ]
 
-            if any("eo:bands" in asset_object for asset_object in result["assets"].values()):
-                result["stac_extensions"].append(STAC_EXTENSION.EO)
+            if sniff_stac_extension_prefix(result["assets"].values(), prefix="eo:"):
+                result["stac_extensions"].append(STAC_EXTENSION.EO_V110)
 
             if any(key.startswith("proj:") for key in result["properties"]) or any(
                 key.startswith("proj:") for key in result["assets"]
@@ -1315,13 +1289,20 @@ def register_views_batch_jobs(
             raise FilePathInvalidException(f"{filename!r} not in {list(results.keys())}")
         result = results[filename]
         if result.get("href", "").startswith("s3://"):
-            return _stream_from_s3(result["href"], result, request.headers.get("Range"))
+            return _stream_from_s3(
+                result["href"], filename=filename, mimetype=result.get("type"), bytes_range=request.headers.get("Range")
+            )
         elif "output_dir" in result:
             out_dir_url = result["output_dir"]
             if out_dir_url.startswith("s3://"):
                 # TODO: Would be nice if we could use the s3:// URL directly without splitting into bucket and key.
                 # Ignoring the "s3://" at the start makes it easier to split into the bucket and the rest.
-                resp = _stream_from_s3(f"{out_dir_url}/{filename}", result, request.headers.get("Range"))
+                resp = _stream_from_s3(
+                    f"{out_dir_url}/{filename}",
+                    filename=filename,
+                    mimetype=result.get("type"),
+                    bytes_range=request.headers.get("Range"),
+                )
             else:
                 resp = send_from_directory(result["output_dir"], filename, mimetype=result.get("type"))
                 resp.headers['Accept-Ranges'] = 'bytes'
@@ -1332,11 +1313,17 @@ def register_views_batch_jobs(
             _log.error(f"Unsupported job result: {result!r}")
             raise InternalException("Unsupported job result")
 
-    def _stream_from_s3(s3_url, result, bytes_range: Optional[str]):
+    def _stream_from_s3(s3_url, *, filename, mimetype: Optional[str], bytes_range: Optional[str]):
+        # Local imports as S3 requirements are optional
         import botocore.exceptions
+        from openeo_driver.integrations.s3.client import S3ClientBuilder
 
         bucket, key = s3_url[5:].split("/", 1)
-        s3_instance = _s3_client()
+        details = BucketDetails.from_name(bucket)
+        if details.type is not "UNKNOWN":
+            s3_instance = S3ClientBuilder.from_region(details.region)
+        else:
+            s3_instance = S3ClientBuilder.from_region(None)
 
         try:
             s3_file_object = s3_instance.get_object(Bucket=bucket, Key=key, **dict_no_none(Range=bytes_range))
@@ -1344,22 +1331,22 @@ def register_views_batch_jobs(
             resp = flask.Response(
                 response=body.iter_chunks(STREAM_CHUNK_SIZE_DEFAULT),
                 status=206 if bytes_range else 200,
-                mimetype=result.get("type"),
+                mimetype=mimetype,
             )
             resp.headers['Accept-Ranges'] = 'bytes'
             resp.headers['Content-Length'] = s3_file_object['ContentLength']
             if 'ContentRange' in s3_file_object:
                 resp.headers['Content-Range'] = s3_file_object['ContentRange']
             return resp
-        except s3_instance.exceptions.NoSuchKey:
-            _log.exception(f"No such key: s3://{bucket}/{key}")
-            raise
+        except s3_instance.exceptions.NoSuchKey as e:
+            _log.exception(f"Not found: {s3_url}")
+            raise NotFoundException(message=f"Not found: {filename}") from e
         except botocore.exceptions.ClientError as e:
             if e.response.get("ResponseMetadata").get("HTTPStatusCode") == 416:  # best effort really
                 raise OpenEOApiException(
                     code="RangeNotSatisfiable", status_code=416,
                     message=f"Invalid Range {bytes_range}"
-                )
+                ) from e
 
             raise
 
@@ -1434,9 +1421,9 @@ def register_views_batch_jobs(
             "type": "Feature",
             "stac_version": "1.0.0",
             "stac_extensions": [
-                STAC_EXTENSION.EO,
+                STAC_EXTENSION.EO_V110,
                 STAC_EXTENSION.FILEINFO,
-                STAC_EXTENSION.PROJECTION
+                STAC_EXTENSION.PROJECTION,
             ],
             "id": item_id,
             "geometry": geometry,
@@ -1480,7 +1467,9 @@ def register_views_batch_jobs(
         for asset in assets.values():
             if not asset["href"].startswith("http"):
                 asset_file_name = pathlib.Path(asset["href"]).name
-                asset["href"] = _job_result_download_url(job_id, user_id, asset_file_name)
+                asset["href"] = backend_implementation.config.asset_url.build_url(
+                    asset_metadata=asset, asset_name=asset_file_name, job_id=job_id, user_id=user_id
+                )
         stac_item = {
             "stac_version": ml_model_metadata.get("stac_version", "0.9.0"),
             "stac_extensions": ml_model_metadata.get("stac_extensions", []),
@@ -1502,9 +1491,12 @@ def register_views_batch_jobs(
             {
                 "title": asset_metadata.get("title", filename),
                 "href": asset_metadata.get(BatchJobs.ASSET_PUBLIC_HREF)
-                or _job_result_download_url(job_id, user_id, filename),
+                or backend_implementation.config.asset_url.build_url(
+                    asset_metadata=asset_metadata, asset_name=filename, job_id=job_id, user_id=user_id
+                ),
                 "type": asset_metadata.get("type", asset_metadata.get("media_type", "application/octet-stream")),
                 "roles": asset_metadata.get("roles", ["data"]),
+                # TODO: eliminate this legacy "raster:bands" construct at some point?
                 "raster:bands": asset_metadata.get("raster:bands"),
                 "file:size": asset_metadata.get("file:size"),
                 "alternate": asset_metadata.get("alternate"),
@@ -1515,20 +1507,49 @@ def register_views_batch_jobs(
             return result_dict
         bands = asset_metadata.get("bands")
 
+        if bands:
+            # TODO: #298 this is a quick stop-gap solution for lack of clear API
+            #       what "bands" actually is expected to be:
+            #       a list of Band objects (current approach in openeo-geopyspark-driver)
+            #       or a list of dictionaries (as handled in openeo-aggregator)
+            # TODO: move this normalization to a more general utility?
+            bands = [
+                openeo.metadata.Band(
+                    name=b.get("name"),
+                    common_name=b.get("eo:common_name") or b.get("common_name"),
+                    wavelength_um=b.get("eo:center_wavelength") or b.get("center_wavelength"),
+                )
+                if isinstance(b, dict)
+                else b
+                for b in bands
+            ]
+
+            # TODO: eliminate this legacy "eo:bands" construct at some point?
+            result_dict["eo:bands"] = [
+                dict_no_none(
+                    {
+                        "name": band.name,
+                        "common_name": band.common_name,
+                        "center_wavelength": band.wavelength_um,
+                    }
+                )
+                for band in bands
+            ]
+            # TODO: "bands" is a STAC>=1.1 feature, but here we don't know what version we are in.
+            result_dict["bands"] = [
+                dict_no_none(
+                    {
+                        "name": band.name,
+                        "eo:common_name": band.common_name,
+                        "eo:center_wavelength": band.wavelength_um,
+                    }
+                )
+                for band in bands
+            ]
+
         result_dict.update(
             dict_no_none(
                 **{
-                    "eo:bands": [
-                        dict_no_none(
-                            **{
-                                "name": band.name,
-                                "center_wavelength": band.wavelength_um,
-                            }
-                        )
-                        for band in bands
-                    ]
-                    if bands
-                    else None,
                     "proj:bbox": asset_metadata.get("proj:bbox", job_info.proj_bbox),
                     "proj:epsg": asset_metadata.get("proj:epsg", job_info.epsg),
                     "proj:shape": asset_metadata.get("proj:shape", job_info.proj_shape),
@@ -1826,7 +1847,9 @@ def _normalize_collection_metadata(metadata: dict, api_version: ComparableVersio
     # Version dependent metadata conversions
     cube_dims_100 = deep_get(metadata, "cube:dimensions", default=None)
     cube_dims_040 = deep_get(metadata, "properties", "cube:dimensions", default=None)
+    bands_110 = deep_get(metadata, "summaries", "bands", default=None)
     eo_bands_100 = deep_get(metadata, "summaries", "eo:bands", default=None)
+    # TODO do we still need normalization of openEO 0.4 style eo:bands?
     eo_bands_040 = deep_get(metadata, "properties", "eo:bands", default=None)
     extent_spatial_100 = deep_get(metadata, "extent", "spatial", "bbox", default=None)
     extent_spatial_040 = deep_get(metadata, "extent", "spatial", default=None)
@@ -1836,6 +1859,19 @@ def _normalize_collection_metadata(metadata: dict, api_version: ComparableVersio
     if full and not cube_dims_100 and cube_dims_040:
         _log.warning("Collection metadata 'cube:dimensions' in API 0.4 style instead of 1.0 style")
         metadata["cube:dimensions"] = cube_dims_040
+    if full and not bands_110 and eo_bands_100:
+        _log.warning("_normalize_collection_metadata: converting eo:bands to bands metadata")
+        # TODO #298/#363: "bands" is a STAC>=1.1 feature, but here we don't know what version we are in.
+        metadata["summaries"]["bands"] = [
+            dict_no_none(
+                {
+                    "name": b.get("name"),
+                    "eo:common_name": b.get("common_name"),
+                    "eo:center_wavelength": b.get("center_wavelength"),
+                }
+            )
+            for b in eo_bands_100
+        ]
     if full and not eo_bands_100 and eo_bands_040:
         _log.warning("Collection metadata 'eo:bands' in API 0.4 style instead of 1.0 style")
         metadata.setdefault("summaries", {})
@@ -1863,13 +1899,14 @@ def _normalize_collection_metadata(metadata: dict, api_version: ComparableVersio
                     dim["extent"] = interval
 
     # Make sure some required fields are set.
+    # TODO #363 bump stac_version default to 1.0.0 or even 1.1.0?
     metadata.setdefault("stac_version", "0.9.0")
     metadata.setdefault(
         "stac_extensions",
         [
             # TODO: enable these extensions only when necessary?
             STAC_EXTENSION.DATACUBE,
-            STAC_EXTENSION.EO,
+            STAC_EXTENSION.EO_V110,
         ],
     )
 

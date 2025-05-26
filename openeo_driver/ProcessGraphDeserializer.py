@@ -579,16 +579,18 @@ def _align_extent(extent,collection_id,env,target_resolution=None):
 
     x = metadata.get('cube:dimensions', {}).get('x', {})
     y = metadata.get('cube:dimensions', {}).get('y', {})
-    if (target_resolution == None and collection_resolution != None ):
-        target_resolution = collection_resolution
-    elif target_resolution == None:
+
+    if (target_resolution == None and collection_resolution == None):
         return extent
+
 
     if (    crs == 4326
             and extent.get('crs','') == "EPSG:4326"
             and "extent" in x and "extent" in y
+            and (target_resolution == None or  target_resolution == collection_resolution)
     ):
-
+        #only align to collection resolution
+        target_resolution = collection_resolution
         def align(v, dimension, rounding, resolution):
             range = dimension.get('extent', [])
             if v < range[0]:
@@ -829,9 +831,18 @@ def _check_geometry_path_assumption(path: str, process: str, parameter: str):
 
 @non_standard_process(
     ProcessSpec(id='vector_buffer', description="Add a buffer around a geometry.")
-        .param(name='geometries', description="Input geometry (GeoJSON object) to add buffer to.",
-               schema={"type": "object", "subtype": "geojson"})
-        .param(name='distance', description="The size of the buffer. Can be negative to subtract the buffer",
+        .param(name='geometries', description="Input geometry to add buffer to, vector-cube or GeoJSON(deprecated).",
+               schema=[{
+                "type": "object",
+                "subtype": "datacube",
+                "dimensions": [
+                    {
+                        "type": "geometry"
+                    }
+                ]
+            },{"type": "object", "subtype": "geojson"}]
+        )
+        .param(name='distance', description="The distance of the buffer in meters. A positive distance expands the geometries, resulting in outward buffering (dilation), while a negative distance shrinks the geometries, resulting in inward buffering (erosion).\n\nIf the unit of the spatial reference system is not meters, a `UnitMismatch` error is thrown. Use ``vector_reproject()`` to convert the geometries to a suitable spatial reference system.",
                schema={"type": "number"}, required=True)
         .returns(description="Output geometry (GeoJSON object) with the added or subtracted buffer",
                  schema={"type": "object", "subtype": "geojson"})
@@ -1644,6 +1655,9 @@ def run_udf(args: dict, env: EvalEnv):
         # This way a weak_spatial_extent can be calculated from the UDF's output.
         return data.run_udf()
 
+    if env.get("validation", False):
+        raise FeatureUnsupportedException("run_udf is not supported in validation mode.")
+
     if isinstance(data, SupportsRunUdf) and data.supports_udf(udf=udf, runtime=runtime):
         _log.info(f"run_udf: data of type {type(data)} has direct run_udf support")
         return data.run_udf(udf=udf, runtime=runtime, context=context, env=env)
@@ -1859,7 +1873,10 @@ def apply_process(process_id: str, args: dict, namespace: Union[str, None], env:
         return process_function(args=ProcessArgs(args, process_id=process_id), env=env)
     except ProcessUnsupportedException as e:
         pass
-
+    except OpenEOApiException:
+        raise
+    except Exception as e:
+        raise OpenEOApiException(f"Unexpected error during {process_id!r} with {args!r}: {e!r}") from e
 
     if namespace in ["user", None]:
         user = env.get("user")

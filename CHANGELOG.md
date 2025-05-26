@@ -19,7 +19,22 @@ and start a new "In Progress" section above it.
 
 <!-- start-of-changelog -->
 
-## In progress: 0.134.0
+## In progress: 0.135.0
+
+- Have `integrations.s3` for interaction with Object Storage that follows the S3 API.
+
+## 0.134.0
+
+- Introduce `asset_url` option to allow backend implementations to have custom code for retrieving assets. Default
+  behavior remains unchanged.
+- Improve data cube dimension detection in `load_stac` dry-run ([#394](https://github.com/Open-EO/openeo-python-driver/issues/394))
+- Download asset: return `NoSuchKey` error as 404 Not Found response [Open-EO/openeo-geopyspark-driver#1149](https://github.com/Open-EO/openeo-geopyspark-driver/issues/1149)
+- Preserve original non-spatial dimensions in `resample_cube_spatial` dry run ([#397](https://github.com/Open-EO/openeo-python-driver/issues/397))
+- Fix compatibility with Shapely2 ([#158](https://github.com/Open-EO/openeo-python-driver/issues/158))
+- Allow `overlap` in `apply_neighborhood` to be not specified ([#401](https://github.com/Open-EO/openeo-python-driver/issues/401))
+- Start including STAC-1.1.0-style "bands" metadata in assets in batch job results ([#298](https://github.com/Open-EO/openeo-python-driver/issues/298))
+- Start including STAC-1.1.0-style "bands" summaries in collection metadata ([#298](https://github.com/Open-EO/openeo-python-driver/issues/298))
+- Harden "bands" metadata handling in batch job results listings ([Open-EO/openeo-aggregator#183](https://github.com/Open-EO/openeo-aggregator/issues/183))
 
 
 ## 0.133.0

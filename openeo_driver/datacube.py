@@ -18,12 +18,13 @@ import shapely.geometry.base
 import shapely.ops
 import xarray
 from geopandas import GeoDataFrame, GeoSeries
-from openeo.metadata import CollectionMetadata
+from openeo.metadata import CollectionMetadata, CubeMetadata
 from openeo.util import ensure_dir, str_truncate
 from pyproj import CRS
 
 from openeo_driver.datastructs import ResolutionMergeArgs, SarBackscatterArgs, StacAsset
-from openeo_driver.errors import FeatureUnsupportedException, InternalException, ProcessGraphInvalidException
+from openeo_driver.errors import FeatureUnsupportedException, InternalException, ProcessGraphInvalidException, \
+    OpenEOApiException
 from openeo_driver.util.geometry import GeometryBufferer, reproject_geometry, validate_geojson_coordinates
 from openeo_driver.util.ioformats import IOFORMATS
 from openeo_driver.util.pgparsing import SingleRunUDFProcessGraph
@@ -55,10 +56,12 @@ class SupportsRunUdf(metaclass=abc.ABCMeta):
 class DriverDataCube:
     """Base class for "driver" side raster data cubes."""
 
-    def __init__(self, metadata: CollectionMetadata = None):
-        self.metadata = (
-            metadata if isinstance(metadata, CollectionMetadata) else CollectionMetadata(metadata=metadata or {})
-        )
+    def __init__(self, metadata: Optional[CubeMetadata] = None):
+        if isinstance(metadata, dict):
+            # TODO: remove this security net once we're sure it's not necessary anymore
+            log.warning("DriverDataCube: deprecated dict-based metadata usage")
+            metadata = CollectionMetadata(metadata=metadata)
+        self.metadata: CubeMetadata = metadata or CubeMetadata()
 
     def __eq__(self, o: object) -> bool:
         if o.__class__ == self.__class__:
@@ -97,7 +100,13 @@ class DriverDataCube:
         self._not_implemented()
 
     def apply_neighborhood(
-        self, process: dict, *, size: List[dict], overlap: List[dict], context: Optional[dict] = None, env: EvalEnv
+        self,
+        process: dict,
+        *,
+        size: List[dict],
+        overlap: Optional[List[dict]] = None,
+        context: Optional[dict] = None,
+        env: EvalEnv,
     ) -> "DriverDataCube":
         self._not_implemented()
 
@@ -400,11 +409,19 @@ class DriverVectorCube:
         columns_for_cube = (options or {}).get("columns_for_cube", cls.COLUMN_SELECTION_NUMERICAL)
         # TODO #114 EP-3981: lazy loading like/with DelayedVector
         # note for GeoJSON: will consider Feature.id as well as Feature.properties.id
-        if driver and "parquet" == driver.lower():
-            return cls.from_parquet(paths=paths, columns_for_cube=columns_for_cube)
-        else:
-            gdf = gpd.read_file(paths[0], driver=driver)
-            return cls.from_geodataframe(gdf, columns_for_cube=columns_for_cube)
+        try:
+            if driver and "parquet" == driver.lower():
+                return cls.from_parquet(paths=paths, columns_for_cube=columns_for_cube)
+            else:
+                gdf = gpd.read_file(paths[0], driver=driver)
+                return cls.from_geodataframe(gdf, columns_for_cube=columns_for_cube)
+        except Exception as e:
+            if not isinstance(e, OpenEOApiException):
+                raise OpenEOApiException(code="load_url_reading_error", status_code=400,
+                                         message=f"load_url failed for {paths} with format {driver}: {str(e)}")
+            else:
+                raise e
+
 
     @classmethod
     def from_parquet(
@@ -594,6 +611,8 @@ class DriverVectorCube:
         gdf = self._as_geopandas_df(flatten_prefix=options.get("flatten_prefix"))
         if format_info.format == "Parquet":
             gdf.to_parquet(path)
+        elif format_info.format.lower() == "csv":
+            gdf.to_csv(path)
         else:
             gdf.to_file(str(path), driver=format_info.fiona_driver, crs=self.get_crs())
 

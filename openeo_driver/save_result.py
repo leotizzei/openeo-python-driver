@@ -306,6 +306,8 @@ class AggregatePolygonResult(JSONResult):  # TODO: if it supports NetCDF and CSV
             warnings.warn("AggregatePolygonResult: GeometryCollection or DriverVectorCube expected but got {t}".format(t=type(regions)))
         self._regions = regions
         self._metadata = metadata
+        # TODO #298 this "raster:bands" helper is old-style
+        #      and just used for "statistics" which moved to the common metadata in v2
         self.raster_bands = None
 
     def get_data(self):
@@ -430,10 +432,10 @@ class AggregatePolygonResult(JSONResult):  # TODO: if it supports NetCDF and CSV
 
     def to_netcdf(self, destination: Optional[str] = None) -> str:
         def features_ids_from_index(geometries):
-            return ['feature_%d' % i for i in range(len(geometries))]
+            return ["feature_%d" % i for i in range(len(geometries.geoms))]
 
         if isinstance(self._regions, GeometryCollection):
-            points = [r.representative_point() for r in self._regions]
+            points = [r.representative_point() for r in self._regions.geoms]
             feature_ids = features_ids_from_index(self._regions)
         else:
             points = [r.representative_point() for r in self._regions.get_geometries()]
@@ -662,7 +664,6 @@ class AggregatePolygonResultCSV(AggregatePolygonResult):
     def __init__(self, csv_dir, regions: Union[GeometryCollection, DriverVectorCube, DelayedVector, BaseGeometry], metadata: CollectionMetadata = None):
         super().__init__(timeseries=None, regions=regions, metadata=metadata)
         self._csv_dir = csv_dir
-        self.raster_bands = None
 
     def get_data(self):
         if self.data is None:
@@ -684,7 +685,7 @@ class AggregatePolygonResultCSV(AggregatePolygonResult):
                     geometries = list(regions.geometries)
                     amount_of_regions = len(geometries)
                 elif isinstance(self._regions, GeometryCollection):
-                    amount_of_regions = len(self._regions)
+                    amount_of_regions = len(self._regions.geoms)
                 else:
                     _log.warning("Using polygon with largest index to estimate how many input polygons there where.")
                     amount_of_regions = features.max() + 1
@@ -717,6 +718,8 @@ class AggregatePolygonResultCSV(AggregatePolygonResult):
                 stats["stddev"] = series.std()
                 stats["valid_percent"] = ((100.0 * len(series.dropna()) / len(series)) if len(series) else None)
                 return {"statistics": stats}
+
+            # TODO #298 `raster:bands>statistics` has moved to common STAC in raster extension 2.0.0
             self.raster_bands = [stats(b) for b in bands]
 
         if self.is_format('covjson', 'coveragejson'):
@@ -725,6 +728,10 @@ class AggregatePolygonResultCSV(AggregatePolygonResult):
 
     def to_csv(self, destination=None):
         csv_paths = glob.glob(self._csv_dir + "/*.csv")
+
+        if(len(csv_paths) == 0):
+            _log.warning(f"save_result: no csv files found at expected location: {self._csv_dir}")
+            return
 
         if(len(csv_paths) == 1):
             if(destination == None):

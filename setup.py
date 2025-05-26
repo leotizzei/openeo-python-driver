@@ -33,6 +33,10 @@ tests_require = [
     "dirty-equals>=0.6",
 ]
 
+typing_require = [
+    "mypy-boto3-s3",
+]
+
 setup(
     name="openeo_driver",
     version=version,
@@ -52,12 +56,11 @@ setup(
         "flask>=2.0.0",
         "werkzeug>=3.0.3",  # https://github.com/Open-EO/openeo-python-driver/issues/243
         "requests>=2.28.0",
-        "openeo>=0.38.0",
+        "openeo>=0.41.0.a2.dev",
         "openeo_processes==0.0.4",  # 0.0.4 is special build/release, also see https://github.com/Open-EO/openeo-python-driver/issues/152
         "gunicorn>=20.0.1",
         "numpy>=1.22.0",
-        "shapely<2.0.0; python_version<='3.9'",
-        "shapely>=2.0.0; python_version>'3.9'",
+        "shapely>=1.8.5",  # TODO #158 bump requirement to at least 2.0.0 for simplicity (once openeo-geopyspark-driver allows it too)
         "pandas>=1.4.0",
         "geopandas>=0.11.0",  # 0.11.0 fixes https://github.com/geopandas/geopandas/pull/2243
         "xarray>=0.16.2",
@@ -73,10 +76,10 @@ setup(
         "reretry~=0.11.8",
         "markdown>3.4",
         "traceback-with-variables==2.0.4",
-        "pystac>=1.8.0",
+        "pystac~=1.8.0",  # TODO #370/#396 bump to more recent pystac version
     ],
     extras_require={
-        "dev": tests_require,
+        "dev": tests_require + typing_require,
         "s3": ["boto3[s3]>=1.26.17", "botocore"],
         "vault": ["hvac>=1.0.2"],
     },
